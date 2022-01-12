@@ -1,39 +1,44 @@
 package com.example.demo.geonames.streamingscrollscan;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.Time;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
-import org.elasticsearch.action.search.ClearScrollRequest;
-import org.elasticsearch.action.search.SearchRequest;
-import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchScrollRequest;
 import org.elasticsearch.client.RequestOptions;
-import org.elasticsearch.client.RestHighLevelClient;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.search.SearchHits;
+import org.elasticsearch.client.RestClient;
 
 import java.io.IOException;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 
-public class ScrollScanIterator implements Iterator<SearchHits>, AutoCloseable {
-    public static final TimeValue KEEP_ALIVE = TimeValue.timeValueMinutes(10);
-    public final RestHighLevelClient client;
+@RequiredArgsConstructor(access = AccessLevel.PRIVATE)
+public class ScrollScanIterator<T> implements Iterator<SearchResponse<T>>, AutoCloseable {
+    public static final Time KEEP_ALIVE = Time.of(t -> t.time("10s"));
+    public final ElasticsearchClient client;
     public final SearchRequest searchRequest;
+    private final Class<T> documentClass;
 
-    private SearchResponse lastResponse;
+    private SearchResponse<T> lastResponse;
 
-    public ScrollScanIterator(RestHighLevelClient client, SearchRequest searchRequest) {
-        this.client = client;
-        this.searchRequest = searchRequest;
+
+    public static <T> ScrollScanIterator<T> of(ElasticsearchClient client, SearchRequest searchRequest, Class<T> documentClass) {
+        if (searchRequest.scroll() == null) {
+            throw new IllegalArgumentException("Search request must have 'scroll()' set");
+        }
+        return new ScrollScanIterator<>(client, searchRequest, documentClass);
     }
 
     @Override
     public boolean hasNext() {
-        return lastResponse == null || lastResponse.getHits().getHits().length > 0;
+        return lastResponse == null || lastResponse.documents().size() > 0;
     }
 
     @SneakyThrows
     @Override
-    public SearchHits next() {
+    public SearchResponse<T> next() {
         if (!hasNext()) {
             throw new NoSuchElementException();
         }
@@ -42,23 +47,19 @@ public class ScrollScanIterator implements Iterator<SearchHits>, AutoCloseable {
         } else {
             lastResponse = getNextScrollResponse();
         }
-        return lastResponse.getHits();
+        return lastResponse;
     }
 
-    private SearchResponse getInitialResponse() throws IOException {
-        SearchRequest initialSearchRequest = new SearchRequest(searchRequest).scroll(KEEP_ALIVE);
-        return client.search(initialSearchRequest, RequestOptions.DEFAULT);
+    private SearchResponse<T> getInitialResponse() throws IOException {
+        return client.search(searchRequest, documentClass);
     }
 
-    private SearchResponse getNextScrollResponse() throws IOException {
-        SearchScrollRequest scrollRequest = new SearchScrollRequest(lastResponse.getScrollId()).scroll(KEEP_ALIVE);
-        return client.scroll(scrollRequest, RequestOptions.DEFAULT);
+    private SearchResponse<T> getNextScrollResponse() throws IOException {
+        return client.scroll(s -> s.scrollId(lastResponse.scrollId()).scroll(KEEP_ALIVE),documentClass);
     }
 
     @SneakyThrows
     public void close() {
-        ClearScrollRequest clearScrollRequest = new ClearScrollRequest();
-        clearScrollRequest.addScrollId(lastResponse.getScrollId());
-        client.clearScroll(clearScrollRequest, RequestOptions.DEFAULT);
+        client.clearScroll(c -> c.scrollId(lastResponse.scrollId()));
     }
 }

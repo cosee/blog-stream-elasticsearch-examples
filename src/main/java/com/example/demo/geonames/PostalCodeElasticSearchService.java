@@ -1,31 +1,25 @@
 package com.example.demo.geonames;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.Time;
+import co.elastic.clients.elasticsearch.core.BulkResponse;
+import co.elastic.clients.elasticsearch.core.ClearScrollRequest;
+import co.elastic.clients.elasticsearch.core.CountResponse;
+import co.elastic.clients.elasticsearch.core.ScrollRequest;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
+import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
+import co.elastic.clients.json.jackson.JacksonJsonpMapper;
+import co.elastic.clients.transport.ElasticsearchTransport;
+import co.elastic.clients.transport.rest_client.RestClientTransport;
 import com.example.demo.geonames.model.PostalCode;
 import com.example.demo.geonames.streamingscrollscan.ScrollScanIterator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.SneakyThrows;
 import org.apache.http.HttpHost;
-import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
-import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
-import org.elasticsearch.action.bulk.BulkItemResponse;
-import org.elasticsearch.action.bulk.BulkRequest;
-import org.elasticsearch.action.bulk.BulkResponse;
-import org.elasticsearch.action.index.IndexRequest;
-import org.elasticsearch.action.search.ClearScrollRequest;
-import org.elasticsearch.action.search.SearchRequest;
-import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchScrollRequest;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestClient;
-import org.elasticsearch.client.RestHighLevelClient;
-import org.elasticsearch.client.core.CountRequest;
-import org.elasticsearch.client.core.CountResponse;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.index.query.QueryBuilders;
-import org.elasticsearch.search.SearchHit;
-import org.elasticsearch.search.SearchHits;
-import org.elasticsearch.search.builder.SearchSourceBuilder;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PreDestroy;
@@ -42,86 +36,97 @@ import java.util.stream.StreamSupport;
 public class PostalCodeElasticSearchService {
 
     public static final String INDEX_NAME = "postalcodes";
-    public static final TimeValue KEEP_ALIVE = TimeValue.timeValueMinutes(10);
+    public static final Time KEEP_ALIVE = Time.of(t -> t.time("10m"));
     public static final int SCROLL_PAGE_SIZE = 1000;
-    private RestHighLevelClient client = new RestHighLevelClient(
-            RestClient.builder(new HttpHost("localhost", 9200, "http"))
-    );
 
-    private ObjectMapper objectMapper = new ObjectMapper();
+    RestClient restClient = RestClient.builder(
+            new HttpHost("localhost", 9200)).build();
+    ElasticsearchTransport transport = new RestClientTransport(
+            restClient, new JacksonJsonpMapper());
+    ElasticsearchClient client = new ElasticsearchClient(transport);
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @SneakyThrows
     public void addPostalCodes(List<PostalCode> postalCodeList) {
-        BulkRequest request;
-        request = new BulkRequest();
-        for (PostalCode postalCode : postalCodeList) {
-            request.add(
-                    new IndexRequest(INDEX_NAME)
-                            .id(postalCode.getId())
-                            .source(objectMapper.writeValueAsString(postalCode), XContentType.JSON)
-            );
-        }
-        BulkResponse bulk = client.bulk(request, RequestOptions.DEFAULT);
-        for (BulkItemResponse item : bulk.getItems()) {
-            if (item.getFailure() != null) {
-                throw new IllegalStateException(item.getFailure().getCause());
+        BulkResponse bulk = client.bulk(b -> b.index(INDEX_NAME)
+                .operations(postalCodeList.stream()
+                        .map(
+                                postalCode -> BulkOperation.of(b1 -> b1
+                                        .index(i -> i
+                                                .id(postalCode.getId()).document(postalCode)
+                                        )
+                                )
+                        )
+                        .collect(Collectors.toList())));
+        for (BulkResponseItem item : bulk.items()) {
+            if (item.error() != null) {
+                throw new IllegalStateException(item.error().reason());
             }
         }
     }
 
     @SneakyThrows
     public void refresh() {
-        client.indices().refresh(new RefreshRequest(INDEX_NAME), RequestOptions.DEFAULT);
+        client.indices().refresh(b -> b.index(INDEX_NAME));
     }
 
     @SneakyThrows
     public List<PostalCode> fetchAllPostalCodes(String countryIso2) {
-        SearchResponse response = client.search(
-                buildSearchRequest(countryIso2),
-                RequestOptions.DEFAULT
-        );
-        return extractPostalCodes(response.getHits());
-    }
-
-    private List<PostalCode> extractPostalCodes(SearchHits hits) {
-        return Stream.of(hits.getHits())
-                .map(this::searchHitToPostalCode)
-                .collect(Collectors.toList());
-    }
-
-    private SearchRequest buildSearchRequest(String countryIso2) {
-        return new SearchRequest(INDEX_NAME).source(
-                new SearchSourceBuilder().query(
-                        QueryBuilders.termsQuery("countryIso2.keyword", countryIso2)
-                ).size(SCROLL_PAGE_SIZE)
-        );
+        SearchRequest request = buildSearchRequest(countryIso2);
+        SearchResponse<PostalCode> search = client.search(request, PostalCode.class);
+        return search.documents();
     }
 
     @SneakyThrows
     public List<PostalCode> fetchAllPostalCodesByScrollScan(String countryIso2) {
+        SearchResponse<PostalCode> initialResponse = client.search(s ->
+                        prepareSearchBuilder(s, countryIso2).scroll(KEEP_ALIVE),
+                PostalCode.class);
 
-        SearchResponse initialResponse = client.search(
-                buildSearchRequest(countryIso2)
-                        .scroll(KEEP_ALIVE),
-                RequestOptions.DEFAULT);
-        List<PostalCode> result = new LinkedList<>(extractPostalCodes(initialResponse.getHits()));
+        List<PostalCode> result = new LinkedList<>(initialResponse.documents());
         List<PostalCode> postalCodes;
-        String scrollId = initialResponse.getScrollId();
+        String scrollId = initialResponse.scrollId();
         try {
-            SearchResponse scrollResponse;
+            SearchResponse<PostalCode> scrollResponse;
             do {
-                scrollResponse = client.scroll(new SearchScrollRequest(scrollId).scroll(KEEP_ALIVE), RequestOptions.DEFAULT);
-                postalCodes = extractPostalCodes(scrollResponse.getHits());
-                scrollId = scrollResponse.getScrollId();
+                scrollResponse = client.scroll(buildScrollRequest(scrollId), PostalCode.class);
+                postalCodes = scrollResponse.documents();
+                scrollId = scrollResponse.scrollId();
                 result.addAll(postalCodes);
-            } while (scrollResponse.getHits().getHits().length > 0);
+            } while (scrollResponse.documents().size() > 0);
         } finally {
-            ClearScrollRequest clearScrollRequest = new ClearScrollRequest();
-            clearScrollRequest.addScrollId(scrollId);
-            client.clearScroll(clearScrollRequest, RequestOptions.DEFAULT);
+            client.clearScroll(buildClearScrollRequest(scrollId));
         }
 
         return result;
+    }
+
+    private SearchRequest buildSearchRequest(String countryIso2) {
+        return SearchRequest.of(b -> prepareSearchBuilder(b, countryIso2)
+        );
+    }
+
+    private SearchRequest.Builder prepareSearchBuilder(SearchRequest.Builder builder, String countryIso2) {
+        return builder
+                .index(INDEX_NAME)
+                .query(q -> q
+                        .term(t -> t
+                                .field("countryIso2.keyword")
+                                .value(v -> v
+                                        .stringValue(countryIso2)
+                                )
+                        )
+                )
+                .size(SCROLL_PAGE_SIZE);
+    }
+
+    private ScrollRequest buildScrollRequest(String scrollId) {
+        return ScrollRequest.of(s -> s.scrollId(scrollId).scroll(KEEP_ALIVE));
+    }
+
+    private ClearScrollRequest buildClearScrollRequest(String scrollId) {
+        return ClearScrollRequest.of(c->c.scrollId(scrollId));
     }
 
     public Stream<PostalCode> streamAllPostalCodesByScrollScan(String countryIso2) {
@@ -130,33 +135,26 @@ public class PostalCodeElasticSearchService {
     }
 
     private Stream<PostalCode> streamSearchHits(SearchRequest searchRequest) {
-        ScrollScanIterator scrollScanIterator = new ScrollScanIterator(client, searchRequest);
-        Spliterator<SearchHits> spliterator = Spliterators.spliteratorUnknownSize(scrollScanIterator, 0);
+        ScrollScanIterator<PostalCode> scrollScanIterator = ScrollScanIterator.of(client, searchRequest, PostalCode.class);
+        Spliterator<SearchResponse<PostalCode>> spliterator = Spliterators.spliteratorUnknownSize(scrollScanIterator, 0);
         return StreamSupport.stream(spliterator, false)
                 .onClose(scrollScanIterator::close)
-                .flatMap(searchHits -> Stream.of(searchHits.getHits()))
-                .map(this::searchHitToPostalCode);
-    }
-
-    @SneakyThrows
-    private PostalCode searchHitToPostalCode(SearchHit searchHit) {
-        return objectMapper.readValue(searchHit.getSourceAsString(), PostalCode.class);
+                .flatMap(searchHits -> searchHits.documents().stream());
     }
 
     @SneakyThrows
     void deleteIndex() {
-        DeleteIndexRequest request = new DeleteIndexRequest(INDEX_NAME);
-        client.indices().delete(request, RequestOptions.DEFAULT);
+        client.indices().delete(d -> d.index(INDEX_NAME));
     }
 
     @SneakyThrows
     public long countAllPostalCodes() {
-        CountResponse count = client.count(new CountRequest(INDEX_NAME).query(QueryBuilders.matchAllQuery()), RequestOptions.DEFAULT);
-        return count.getCount();
+        CountResponse count = client.count(c -> c.index(INDEX_NAME).query(q->q.matchAll(m -> m)));
+        return count.count();
     }
 
     @PreDestroy
     private void shutdown() throws IOException {
-        client.close();
+        restClient.close();
     }
 }
