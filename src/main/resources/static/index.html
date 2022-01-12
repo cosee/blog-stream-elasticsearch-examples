@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>ElasticSearch streaming demo app</title>
+</head>
+<body>
+
+<h1>Demo Application</h1>
+
+<button onclick="importPostalCodes()">Import postal codes</button>
+<button onclick="deletePostalCodes()">Delete postal codes</button>
+
+<p>Before clicking the examples, open the dev-tools in the network tab to
+    see how much time-to-first-by and download time happens.</p>
+
+<h2>Buffered</h2>
+
+<p>Data is collected in the backend before responding</p>
+
+<a href="/postal-codes/DE/buffered">/postal-codes/DE/buffered</a>
+
+<h2>Streamed</h2>
+
+<p>Data is sent in response while collecting</p>
+
+<a href="/postal-codes/DE/streamed">/postal-codes/DE/streamed</a>
+
+<h2>Streamed with buffer flushes</h2>
+
+<p>Data is sent in response while collecting. Response buffers are flushed
+    after each entry.</p>
+
+<a href="/postal-codes/DE/">/postal-codes/DE/</a>
+
+<hr>
+
+<h2>Stream slow numbers</h2>
+
+<p>Without flushing buffers. Long time-to-first-byte because data does not
+    fill the response buffer</p>
+
+<a href="/slowNumbers/plain">/slowNumbers/plain</a>
+
+<h2>Stream slow numbers with buffer flush</h2>
+<p>Buffer will be flushed after each item.</p>
+<a href="/slowNumbers/wrapped">/slowNumbers/wrapped</a>
+
+
+
+<script type="text/javascript">
+  function importPostalCodes () {
+    fetch('/postal-codes', { method: 'POST' }).catch((error) => alert(error.message))
+  }
+
+  function deletePostalCodes () {
+    fetch('/postal-codes', { method: 'DELETE' }).catch((error) => alert(error.message))
+  }
+</script>
+</body>
+</html>

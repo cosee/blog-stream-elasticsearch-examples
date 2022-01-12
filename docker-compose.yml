@@ -1,0 +1,23 @@
+version: '3'
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.16.2
+    ports:
+      - 9200:9200
+      - 9300:9300
+    environment:
+      - "discovery.type=single-node"
+  mitmproxy:
+    # can be used to inspect communication with elastic-search
+    image: mitmproxy/mitmproxy
+    command: mitmweb --web-iface 0.0.0.0 --mode reverse:http://elasticsearch:9200
+    ports:
+      - 9299:8080
+      - 8081:8081
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.16.2
+    environment:
+      SERVER_NAME: localhost
+      ELASTICSEARCH_URL: http://elasticsearch:9200/
+    ports:
+      - 5601:5601
